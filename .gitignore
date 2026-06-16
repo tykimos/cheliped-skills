@@ -1,4 +1,5 @@
-scripts/node_modules/
-scripts/dist/
-scripts/*.tsbuildinfo
+browser/scripts/node_modules/
+browser/scripts/dist/
+browser/scripts/*.tsbuildinfo
+computer-use/scripts/node_modules/
 .omc/
