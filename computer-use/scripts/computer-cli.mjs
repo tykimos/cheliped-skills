@@ -76,11 +76,20 @@ const handlers = {
   },
 
   async "screen-size"() {
-    const r = await osa(
-      'tell application "Finder" to get bounds of window of desktop'
-    );
-    const [x1, y1, x2, y2] = r.split(",").map((n) => parseInt(n.trim(), 10));
-    return { width: x2 - x1, height: y2 - y1 };
+    // system_profiler needs no Automation permission. Prefer the logical
+    // ("UI Looks like") resolution since click/move coordinates are in points.
+    const info = await sh("system_profiler", ["SPDisplaysDataType"]).catch(() => "");
+    const logical = info.match(/UI Looks like:\s*(\d+)\s*x\s*(\d+)/i);
+    const native = info.match(/Resolution:\s*(\d+)\s*x\s*(\d+)/i);
+    const m = logical || native;
+    if (m) return { width: Number(m[1]), height: Number(m[2]) };
+    // Fallback: derive from a screenshot's pixel size via sips.
+    const tmp = path.join(os.tmpdir(), `cheliped-size-${Date.now()}.png`);
+    await sh("screencapture", ["-x", tmp]);
+    const dims = await sh("sips", ["-g", "pixelWidth", "-g", "pixelHeight", tmp]);
+    const w = dims.match(/pixelWidth:\s*(\d+)/);
+    const h = dims.match(/pixelHeight:\s*(\d+)/);
+    return { width: w ? Number(w[1]) : null, height: h ? Number(h[1]) : null };
   },
 
   async "mouse-pos"() {
