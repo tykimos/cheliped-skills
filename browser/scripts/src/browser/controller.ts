@@ -444,7 +444,12 @@ export class BrowserController {
       const node = describeResult.node as Record<string, unknown>;
       const nodeId = node.nodeId as number;
 
-      // 2. Get box model
+      // 2. Ensure the element is in the viewport so the box model is clickable.
+      // Off-screen elements otherwise yield coordinates that dispatch a click into
+      // empty space — a silent no-op. (PR-B2)
+      await this.transport.send('DOM.scrollIntoViewIfNeeded', { backendNodeId }).catch(() => {});
+
+      // 3. Get box model
       const boxResult = await this.transport.send('DOM.getBoxModel', {
         backendNodeId,
         nodeId,
@@ -453,11 +458,26 @@ export class BrowserController {
       const model = boxResult.model as Record<string, unknown>;
       const content = model.content as number[];
 
-      // 3. Calculate center
+      // 4. Validate the quad — a degenerate (missing / zero-area / non-finite) box
+      // means the dispatched coordinate would be bogus; throw to fall through to the
+      // JS-based fallback click instead of clicking nothing. (PR-B2)
+      if (!Array.isArray(content) || content.length < 8) {
+        throw new Error('degenerate box model');
+      }
       const x = (content[0] + content[2] + content[4] + content[6]) / 4;
       const y = (content[1] + content[3] + content[5] + content[7]) / 4;
+      // Shoelace area of the content quad.
+      const area = Math.abs(
+        content[0] * content[3] - content[2] * content[1] +
+        content[2] * content[5] - content[4] * content[3] +
+        content[4] * content[7] - content[6] * content[5] +
+        content[6] * content[1] - content[0] * content[7]
+      ) / 2;
+      if (!Number.isFinite(x) || !Number.isFinite(y) || area <= 0) {
+        throw new Error('zero-area or non-finite click target');
+      }
 
-      // 4. Dispatch mouse events
+      // 5. Dispatch mouse events
       await this._dispatchClick(x, y);
     } catch {
       // Fallback: resolve node via CDP and call .click() on the RemoteObject

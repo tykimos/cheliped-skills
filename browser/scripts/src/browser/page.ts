@@ -41,9 +41,19 @@ export class Page {
     };
   }
 
-  async waitForNetworkIdle(idleTimeMs: number = 500, timeout: number = 30000): Promise<void> {
+  // `graceMs` (PR-B3): the idle window applied BEFORE any network request is seen.
+  // For an action that triggers no network at all (e.g. a click on a static page),
+  // this lets us settle quickly instead of always paying the full `idleTimeMs`
+  // floor. Once any request is observed we revert to the full `idleTimeMs`. It
+  // defaults to `idleTimeMs`, so navigation and other callers are unchanged.
+  async waitForNetworkIdle(
+    idleTimeMs: number = 500,
+    timeout: number = 30000,
+    graceMs: number = idleTimeMs,
+  ): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       let pendingRequests = 0;
+      let sawRequest = false;
       let idleTimer: ReturnType<typeof setTimeout> | null = null;
       let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
       let settled = false;
@@ -64,11 +74,12 @@ export class Page {
           idleTimer = setTimeout(() => {
             cleanup();
             resolve();
-          }, idleTimeMs);
+          }, sawRequest ? idleTimeMs : graceMs);
         }
       };
 
       const onRequest = () => {
+        sawRequest = true;
         pendingRequests++;
         if (idleTimer) {
           clearTimeout(idleTimer);
@@ -103,7 +114,9 @@ export class Page {
   }
 
   async waitForStable(timeoutMs: number = 2000): Promise<void> {
-    return this.waitForNetworkIdle(500, timeoutMs);
+    // Post-action settle: a 150ms grace floor when the action triggers no network
+    // (static page), full 500ms idle once any request fires. (PR-B3)
+    return this.waitForNetworkIdle(500, timeoutMs, 150);
   }
 
   async waitForLoad(timeout: number = 30000): Promise<void> {

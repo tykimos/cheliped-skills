@@ -25,7 +25,30 @@ node scripts/cheliped-cli.mjs '[{"cmd":"goto","args":["https://example.com"]},{"
 node scripts/cheliped-cli.mjs '[{"cmd":"fill","args":["3","search term"]},{"cmd":"click","args":["4"]},{"cmd":"observe"}]'
 ```
 
-First call auto-launches Chrome and saves session. Subsequent calls reconnect. Call `close` when done.
+First call auto-launches Chrome and saves session. Subsequent calls reconnect (the reconnect is identity-checked against the browser's DevTools token, so a crashed-and-reused PID/port can't be mistaken for the original Chrome). Call `close` when done.
+
+## Output Envelope
+
+Output is **always a JSON array**, one envelope per command, **compact by default**:
+
+```json
+[{ "cmd": "goto",  "ok": true,  "result": { "url": "...", "title": "..." } },
+ { "cmd": "click", "ok": false, "error": { "code": "E_STALE_ID", "message": "..." } }]
+```
+
+By default each command runs even if a prior one fails (per-command isolation). Error `code` is one of `E_BAD_ARG`, `E_STALE_ID`, `E_TIMEOUT`, `E_BROWSER`, `E_UNKNOWN`.
+
+### CLI flags (before the JSON argument)
+
+| Flag | Effect |
+|------|--------|
+| `--session <name>` | named session (concurrent browsers) |
+| `--no-headless` / `--headed` | run Chrome with a visible window |
+| `--pretty` | indent JSON output (default is compact, fewer tokens) |
+| `--stop-on-error` | fail-fast: halt the batch on the first error |
+| `--chrome-path <path>` | explicit Chrome/Chromium binary (or `CHROME_PATH` env) |
+| `--timeout <ms>` | launch/connect timeout |
+| `--max-links <n>` / `--max-texts <n>` / `--max-text-length <n>` | tune `observe` compression (recall vs tokens) |
 
 ## Commands
 
@@ -130,7 +153,8 @@ The iframe commands use absolute coordinate dispatch (iframe position + element 
 - `fill` works with React/SPA apps (uses native input value setters).
 - Agent DOM is token-compressed — far fewer tokens than raw HTML.
 - Chrome persists between calls until `close`. No restart needed.
-- All output is JSON to stdout. Errors: `{ "error": "message" }`.
+- Output is always a JSON array of `{ cmd, ok, result|error }` envelopes (see **Output Envelope** above); compact by default, `--pretty` to indent.
+- `click` scrolls the target into view and validates its box before dispatching, so off-screen / zero-area elements don't produce a silent no-op.
 - For shadow DOM content (Cloudflare Turnstile, web components): use `observe-shadow` → `click-deep`/`fill-deep`. Supports `>>>` syntax to pierce shadow boundaries.
 - For iframe content (embedded widgets): use `list-frames` → `observe-frame` → `click-frame`/`fill-frame`. Regular `observe`/`click` cannot interact with iframe elements.
 - `list-frames` also discovers iframes hidden inside shadow DOM.

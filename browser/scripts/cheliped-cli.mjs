@@ -81,20 +81,59 @@ function killChrome(pid) {
   }
 }
 
-async function getConnectedCheliped(Cheliped, session, headless = true) {
+// The browser-level DevTools token is stable for the life of a Chrome instance
+// and unique per launch — the right identity signal (the page token stored as
+// `wsUrl` changes as the page navigates/closes).
+const browserTok = (u) => (String(u).match(/devtools\/browser\/([^/?#]+)/) || [])[1];
+
+async function fetchBrowserWsUrl(port) {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/json/version`, {
+      signal: AbortSignal.timeout(2000),
+    });
+    const data = await res.json();
+    return data.webSocketDebuggerUrl || null;
+  } catch {
+    return null;
+  }
+}
+
+// PR-B5: confirm the Chrome listening on `port` is the SAME browser we launched,
+// not a different process that reused the PID/port after a crash.
+async function verifyBrowserIdentity(port, expectedBrowserWsUrl) {
+  if (!expectedBrowserWsUrl) return true; // legacy session without the marker — skip
+  const live = await fetchBrowserWsUrl(port);
+  if (!live) return false; // can't reach devtools → treat as stale
+  return browserTok(live) === browserTok(expectedBrowserWsUrl);
+}
+
+async function getConnectedCheliped(Cheliped, session, opts = {}) {
+  const { headless = true, chromePath, timeout, compression } = opts;
   const cheliped = new Cheliped({
     headless,
     stealth: true,
-    compression: { enabled: true, maxTextLength: 200, maxTexts: 80, maxLinks: 50 },
+    ...(chromePath ? { chromePath } : {}),
+    ...(timeout ? { timeout } : {}),
+    compression: {
+      enabled: true,
+      maxTextLength: 200,
+      maxTexts: 80,
+      maxLinks: 50,
+      ...(compression || {}),
+    },
   });
 
   if (session && session.port) {
-    // 기존 Chrome에 재연결
-    try {
-      await cheliped.reconnect(session.port);
-      return { cheliped, isNew: false };
-    } catch {
-      // 재연결 실패 → 새로 시작
+    // 기존 Chrome에 재연결 — 단, 동일 브라우저 인스턴스인지 먼저 검증
+    if (await verifyBrowserIdentity(session.port, session.browserWsUrl)) {
+      try {
+        await cheliped.reconnect(session.port);
+        return { cheliped, isNew: false };
+      } catch {
+        clearSession();
+      }
+    } else {
+      // PID/포트 재사용으로 다른 Chrome가 점유 → 세션 폐기 후 새로 시작
       clearSession();
     }
   }
@@ -103,14 +142,35 @@ async function getConnectedCheliped(Cheliped, session, headless = true) {
   await cheliped.launch();
   const launchResult = cheliped.getLaunchResult();
   if (launchResult) {
+    // 브라우저 레벨 토큰을 함께 저장해 재연결 시 동일 인스턴스 검증 (PR-B5)
+    const browserWsUrl = await fetchBrowserWsUrl(launchResult.port);
     saveSession({
       port: launchResult.port,
       pid: launchResult.pid,
       wsUrl: launchResult.wsUrl,
+      browserWsUrl,
       createdAt: new Date().toISOString(),
     });
   }
   return { cheliped, isNew: true };
+}
+
+// One-shot CLI: after a `detach` the kept-alive Chrome child keeps Node's event
+// loop open, so the process would linger indefinitely. Flush stdout, then exit
+// (the callback guarantees the write drains first, so output is never truncated).
+function emit(obj, indent) {
+  process.stdout.write(JSON.stringify(obj, null, indent) + '\n', () => process.exit(0));
+}
+
+// Map a thrown error to a stable machine-readable code (SB-2).
+function classifyError(e) {
+  if (e && e.code && /^E_[A-Z_]+$/.test(e.code)) return e.code;
+  const m = (e && e.message) || '';
+  if (/시간 초과|timed out|timeout|ETIMEDOUT/i.test(m)) return 'E_TIMEOUT';
+  if (/agentId|stale|찾을 수 없|not found|no element/i.test(m)) return 'E_STALE_ID';
+  if (/Chrome|browser|연결 실패|launch/i.test(m)) return 'E_BROWSER';
+  if (/필요합니다|유효한|중 하나|required|invalid/i.test(m)) return 'E_BAD_ARG';
+  return 'E_UNKNOWN';
 }
 
 async function executeCommand(cheliped, cmdObj) {
@@ -443,6 +503,11 @@ async function executeCommand(cheliped, cmdObj) {
 async function main() {
   let sessionName = 'default';
   let headless = true;
+  let pretty = false;
+  let stopOnError = false;
+  let chromePath = process.env.CHROME_PATH || undefined;
+  let timeout;
+  const compression = {};
 
   // Parse CLI flags from argv (before the JSON command argument)
   const flagArgs = process.argv.slice(2);
@@ -450,15 +515,33 @@ async function main() {
 
   for (let i = 0; i < flagArgs.length; i++) {
     const arg = flagArgs[i];
+    const next = () => flagArgs[++i];
     if (arg === '--session' && i + 1 < flagArgs.length) {
-      sessionName = flagArgs[i + 1];
-      i++; // skip next
+      sessionName = next();
     } else if (arg.startsWith('--session=')) {
       sessionName = arg.split('=')[1];
     } else if (arg === '--no-headless' || arg === '--headed') {
       headless = false;
     } else if (arg === '--headless') {
       headless = true;
+    } else if (arg === '--pretty') {
+      pretty = true;
+    } else if (arg === '--stop-on-error') {
+      stopOnError = true;
+    } else if (arg === '--chrome-path' && i + 1 < flagArgs.length) {
+      chromePath = next();
+    } else if (arg.startsWith('--chrome-path=')) {
+      chromePath = arg.split('=')[1];
+    } else if (arg === '--timeout' && i + 1 < flagArgs.length) {
+      timeout = parseInt(next(), 10);
+    } else if (arg.startsWith('--timeout=')) {
+      timeout = parseInt(arg.split('=')[1], 10);
+    } else if (arg === '--max-links' && i + 1 < flagArgs.length) {
+      compression.maxLinks = parseInt(next(), 10);
+    } else if (arg === '--max-texts' && i + 1 < flagArgs.length) {
+      compression.maxTexts = parseInt(next(), 10);
+    } else if (arg === '--max-text-length' && i + 1 < flagArgs.length) {
+      compression.maxTextLength = parseInt(next(), 10);
     } else {
       // First non-flag argument is the JSON command
       jsonArgIndex = i;
@@ -473,7 +556,7 @@ async function main() {
   if (!rawArg) {
     console.error(JSON.stringify({
       error: '명령 인수가 필요합니다.',
-      usage: 'node cheliped-cli.mjs [--session <name>] [--no-headless] \'[{"cmd":"goto","args":["https://example.com"]},{"cmd":"observe"}]\'',
+      usage: 'node cheliped-cli.mjs [--session <name>] [--no-headless] [--pretty] [--stop-on-error] [--chrome-path <path>] [--timeout <ms>] [--max-links <n>] [--max-texts <n>] [--max-text-length <n>] \'[{"cmd":"goto","args":["https://example.com"]},{"cmd":"observe"}]\'',
     }));
     process.exit(1);
   }
@@ -495,17 +578,19 @@ async function main() {
     process.exit(1);
   }
 
+  const indent = pretty ? 2 : 0;
+
   // close만 있고 세션 없으면 바로 종료
   if (commands.length === 1 && commands[0].cmd === 'close') {
     const session = loadSession();
     if (!session) {
-      console.log(JSON.stringify([{ cmd: 'close', result: { success: true, message: '세션 없음' } }]));
+      emit([{ cmd: 'close', ok: true, result: { message: '세션 없음' } }], indent);
       return;
     }
     // 세션이 있으면 Chrome kill
     killChrome(session.pid);
     clearSession();
-    console.log(JSON.stringify([{ cmd: 'close', result: { success: true, message: 'Chrome 종료 완료' } }]));
+    emit([{ cmd: 'close', ok: true, result: { message: 'Chrome 종료 완료' } }], indent);
     return;
   }
 
@@ -515,20 +600,26 @@ async function main() {
   let closeRequested = false;
 
   try {
-    const connected = await getConnectedCheliped(Cheliped, session, headless);
+    const connected = await getConnectedCheliped(Cheliped, session, {
+      headless,
+      chromePath,
+      timeout,
+      compression: Object.keys(compression).length ? compression : undefined,
+    });
     cheliped = connected.cheliped;
 
     for (const cmdObj of commands) {
       try {
         const result = await executeCommand(cheliped, cmdObj);
-        results.push({ cmd: cmdObj.cmd, result });
+        results.push({ cmd: cmdObj.cmd, ok: true, result });
         if (cmdObj.cmd === 'close') {
           closeRequested = true;
           break;
         }
       } catch (e) {
-        results.push({ cmd: cmdObj.cmd, error: e.message });
-        break;
+        // QW-3: per-command isolation by default; --stop-on-error restores fail-fast.
+        results.push({ cmd: cmdObj.cmd, ok: false, error: { code: classifyError(e), message: e.message } });
+        if (stopOnError) break;
       }
     }
 
@@ -540,12 +631,13 @@ async function main() {
     clearSession();
     console.error(JSON.stringify({
       error: `브라우저 연결 실패: ${e.message}`,
+      code: classifyError(e),
       hint: '세션 초기화됨. 재실행해 주세요.',
     }));
     process.exit(1);
   }
 
-  console.log(JSON.stringify(results, null, 2));
+  emit(results, indent);
 }
 
 main().catch((err) => {

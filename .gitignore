@@ -3,3 +3,6 @@ browser/scripts/dist/
 browser/scripts/*.tsbuildinfo
 computer-use/scripts/node_modules/
 .omc/
+
+# npm lockfile (project uses pnpm)
+browser/scripts/package-lock.json
